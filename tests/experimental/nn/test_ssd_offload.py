@@ -7,6 +7,8 @@
 Testing SsdBuffer and SsdTensorHandle modules.
 """
 
+import filecmp
+import os
 import tempfile
 
 import numpy as np
@@ -38,6 +40,8 @@ def test_write_read():
 
 
 def test_ssd_handle_dispatch_fwd():
+    _init()
+
     with tempfile.NamedTemporaryFile() as f:
         orig_tensor = torch.randn((128))
         ssd_handle = so.SsdTensorHandle.from_tensor(orig_tensor)
@@ -54,6 +58,8 @@ def test_ssd_handle_dispatch_fwd():
 
 
 def test_ssd_handle_dispatch_bwd():
+    _init()
+
     with tempfile.NamedTemporaryFile() as f:
         orig_tensor = torch.randn((4, 4), requires_grad=True)
         orig_copy = orig_tensor.clone().detach().requires_grad_(True)
@@ -68,8 +74,40 @@ def test_ssd_handle_dispatch_bwd():
         y1.sum().backward()
         y2.sum().backward()
 
-        # TODO: PJ/ASenable assert once Tensor._make_subclass can properly define the tensor's shape
-        # assert torch.equal(ssd_handle.grad, orig_copy.grad)
+        assert torch.equal(ssd_handle.grad, orig_copy.grad)
+
+def test_ssd_handle_train_simple():
+    _init()
+
+    with tempfile.NamedTemporaryFile() as f:
+        orig_tensor = torch.randn((4, 4), requires_grad=True)
+
+        with torch.no_grad():
+            orig_copy = torch.empty_like(orig_tensor)
+            orig_copy.copy_(orig_tensor)
+            orig_copy.requires_grad = True
+
+        ssd_handle = so.SsdTensorHandle.from_tensor(orig_tensor)
+        ssd_handle.set_file_params(f.name, 0)
+        ssd_handle.to_file(release_tensor_after_write=True)
+
+        assert torch.equal(ssd_handle.to_tensor(), orig_tensor)
+        optimizer_ssd = torch.optim.SGD([ssd_handle], lr=0.1)
+        optimizer_orig = torch.optim.SGD([orig_copy], lr=0.1)
+
+        y1 = ssd_handle + 1
+        optimizer_ssd.zero_grad()
+        y1.sum().backward()
+        optimizer_ssd.step()
+
+        y2 = orig_copy + 1
+        optimizer_orig.zero_grad()
+        y2.sum().backward()
+        optimizer_orig.step()
+
+        # make sure we are using the file version not the cached tensor
+        ssd_handle.point_to_file(f.name, 0)
+        assert torch.equal(ssd_handle.to_tensor(), orig_copy)
 
 
 def test_ssd_buffer_basic():
@@ -163,3 +201,105 @@ def test_ssd_buffer_null_buffer():
 
         with pytest.raises(AssertionError):
             hdl = ssd_buf.allocate(128)
+
+
+def test_torch_save_load():
+    _init()
+    orig_file = tempfile.NamedTemporaryFile()
+    checkpoint_file = tempfile.NamedTemporaryFile()
+
+    # TENSOR_SHAPE = (1024, 1024, 1024)
+    # use smaller shape for unit tests
+    TENSOR_SHAPE = (1024, 1024)
+    ref_tensor = torch.rand(TENSOR_SHAPE, dtype=torch.float32)
+    ref_ssd_tensor = so.SsdTensor.fromtensor(ref_tensor, orig_file.name)
+    del ref_tensor
+    # after deleting ref_tensor, memory usage should be very low
+    # For save it shouldn't be more than 10x so.DEFAULT_CHUNK_SIZE
+    so.torch_saver.save(ref_ssd_tensor, checkpoint_file.name)
+    # below line saves file to orig_file.name+"_2"
+    # Memory usage here should be O(1000 * so.DEFAULT_CHUNK_SIZE)
+    # 1000x because that's how many elements the python unpickler
+    # will buffer before passing to the SsdTensor
+    test_ssd_tensor = torch.load(checkpoint_file)
+    assert filecmp.cmp(orig_file.name, orig_file.name + "_2", shallow=False)
+    os.unlink(orig_file.name + "_2")
+
+def test_ssd_param_train_simple():
+    _init()
+    with tempfile.NamedTemporaryFile() as f:
+        orig_tensor = torch.randn((4, 4))
+
+        with torch.no_grad():
+            orig_copy = torch.empty_like(orig_tensor)
+            orig_copy.copy_(orig_tensor)
+            param = torch.nn.Parameter(orig_copy)
+
+        ssd_param = so.SsdParameter(orig_tensor.shape, orig_tensor.dtype)
+        ssd_param.point_to_tensor(orig_copy)
+        ssd_param.set_file_params(f.name, 0)
+        ssd_param.to_file(release_tensor_after_write=True)
+
+        assert torch.equal(ssd_param.to_tensor(), orig_tensor)
+        optimizer_ssd = torch.optim.SGD([ssd_param], lr=0.1)
+        optimizer_orig = torch.optim.SGD([param], lr=0.1)
+
+        y1 = ssd_param + 1
+        optimizer_ssd.zero_grad()
+        y1.sum().backward()
+        optimizer_ssd.step()
+
+        y2 = param + 1
+        optimizer_orig.zero_grad()
+        y2.sum().backward()
+        optimizer_orig.step()
+
+        # make sure we are using the file version not the cached tensor
+        ssd_param.point_to_file(f.name, 0)
+        assert torch.equal(ssd_param.to_tensor(), param)
+
+def test_ssd_flat_parameter_basic():
+    _init()
+    with tempfile.NamedTemporaryFile() as f:
+        refa_param = torch.nn.Parameter(torch.rand((32, 4), dtype=torch.float32))
+        refb_param = torch.nn.Parameter(torch.rand((32, 4), dtype=torch.float32))
+        refc_param = torch.nn.Parameter(torch.rand((128), dtype=torch.float32))
+        ssd_flat_param = so.SsdFlatParameter([refa_param, refb_param, refc_param], f.name, False)
+
+        param_views = list(ssd_flat_param.get_param_views(as_tensor_handle_view=True))
+
+        assert refa_param.shape == param_views[0].shape
+        assert refb_param.shape == param_views[1].shape
+        assert refc_param.shape == param_views[2].shape
+
+        assert torch.equal(refa_param, param_views[0])
+        assert torch.equal(refb_param, param_views[1])
+        assert torch.equal(refc_param, param_views[2])
+        ssd_flat_param.to_file()
+
+        # at this point param_views and ssd_flat_param should all have None tensor
+        assert param_views[0].tensor is None
+        assert param_views[1].tensor is None
+        assert param_views[2].tensor is None
+        assert ssd_flat_param.tensor is None
+
+        # this should trigger ssd_flat_param.to_tensor (and update all the param_views)
+        param_views[0].to_tensor()
+
+        assert param_views[0].tensor is not None
+        assert param_views[1].tensor is not None
+        assert param_views[2].tensor is not None
+        assert ssd_flat_param.tensor is not None
+
+        # check param views change reflected in ssd_flat_param
+        param_views[0][0][0] = -0.0001
+        assert torch.equal(ssd_flat_param.tensor[0], param_views[0][0][0])
+
+        # check to_file on View is ignored
+        param_views[0].to_file()
+
+        assert param_views[0].tensor is not None
+        assert param_views[1].tensor is not None
+        assert param_views[2].tensor is not None
+        assert ssd_flat_param.tensor is not None
+
