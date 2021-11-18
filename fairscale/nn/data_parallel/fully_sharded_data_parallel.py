@@ -335,6 +335,9 @@ class FullyShardedDataParallel(nn.Module):
         if self.fp32_reduce_scatter and not self.mixed_precision:
             raise ValueError("fp32_reduce_scatter requires mixed_precision=True")
 
+        if self.ssd_offload and not self.flatten_parameters:
+            raise ValueError("ssd_offload requires flatten_parameters=True")
+
         # skip validation if the process group was created above
         if process_group:
             validate_process_group(self.compute_device, self.process_group)
@@ -1273,9 +1276,6 @@ class FullyShardedDataParallel(nn.Module):
             self._streams["all_gather"].wait_stream(torch.cuda.current_stream())
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        if self.ssd_offload:
-            self._move_params_to_memory()
-
         self._lazy_init()
 
         # Start of a forward pass.

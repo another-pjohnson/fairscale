@@ -240,96 +240,6 @@ class SsdTensorHandle(torch.Tensor):
         return r
 
 
-class SsdBuffer:
-    """
-    The SsdBuffer represents a single buffer containing a list of tensors. Each of the
-    tensors are represented by a `SsdTensorHandle`.
-
-    Args:
-        num_elems (int): Dictates the size of the 1-D tensor.
-        dtype (torch.dtype): Dtype of the buffer.
-    """
-
-    def __init__(self, num_elems: int, filename: str, dtype: torch.dtype = torch.float32) -> None:
-        self.buffer: torch.Tensor = torch.empty((num_elems,), dtype=dtype)
-        self.filename = filename
-        self.offset = 0
-        self.tensors: Dict[int, SsdTensorHandle] = {}
-        self.storage_state = StorageState.ON_CPU
-
-    def allocate(self, num_elems: int) -> SsdTensorHandle:
-        """Allocates a new tensor handle of size num_elems."""
-        assert num_elems > 0
-        assert self.storage_state == StorageState.ON_CPU, self.storage_state
-        assert self.can_alloc(num_elems)
-
-        tensor = self.buffer.narrow(0, self.offset, num_elems)
-
-        tensor_offset = self.offset
-        handle = SsdTensorHandle.from_tensor(tensor)
-        self.tensors[tensor_offset] = handle
-        handle.set_file_params(self.filename, tensor_offset)
-        self.offset += num_elems
-
-        return handle
-
-    def insert(self, tensor: torch.Tensor) -> SsdTensorHandle:
-        """Insert a new tensor by allocating memory and creating a corresponding handle."""
-        assert self.storage_state == StorageState.ON_CPU, self.storage_state
-        # For the non sharded case, the tensor will not be flattened
-        tensor = tensor.reshape(-1)
-        assert self.buffer.dtype == tensor.dtype
-        handle = self.allocate(tensor.numel())
-        handle.get_tensor().copy_(tensor)
-        return handle
-
-    def can_alloc(self, num_elems: int) -> bool:
-        """Verify that you can allocate a tensor within the bounds
-        of the larger SsdBuffer memory buffer."""
-        assert self.storage_state == StorageState.ON_CPU, self.storage_state
-        return (self.offset + num_elems) <= self.buffer.numel()
-
-    def get_tensors(self) -> List[SsdTensorHandle]:
-        """Returns the list of tensor handles in SsdBuffer."""
-        return [t for t in self.tensors.values()]
-
-    def to_disk(self) -> None:
-        """Writes all tensors backed by handles to disk."""
-        if self.storage_state == StorageState.ON_DISK:
-            return
-        assert self.storage_state == StorageState.ON_CPU, self.storage_state
-        # We use `narrow` so that we write valid tensors that have been allocated
-        # as opposed to the entire SSD buffer.
-        valid_data = self.buffer.narrow(0, 0, self.offset)
-        write(valid_data, self.filename)
-
-        # Remove all Tensor references
-        for offset, t in self.tensors.items():
-            t.point_to_file(self.filename, offset)
-
-        # TODO(anj-s): Setting this to None does not result in GC picking
-        # this reference up.
-        self.buffer = torch.empty((1))
-        self.storage_state = StorageState.ON_DISK
-
-    def from_disk(self, num_elems: int, dtype: torch.dtype = torch.float32) -> None:
-        """Reads all tensors backed by handles into memory."""
-        if self.storage_state == StorageState.ON_CPU:
-            return
-        assert self.storage_state == StorageState.ON_DISK, self.storage_state
-        if num_elems < self.offset:
-            raise RuntimeError(
-                f"Attempted to load from file ssdbuffer of size: {self.offset} into a buffer that is of size: {num_elems}"
-            )
-        self.buffer = torch.empty((num_elems,), dtype=dtype)
-        valid_data = self.buffer.narrow(0, 0, self.offset)
-        read(valid_data, self.filename)
-
-        for offset, t in self.tensors.items():
-            t.point_to_tensor(self.buffer.narrow(0, t.offset, t._numel))
-
-        self.storage_state = StorageState.ON_CPU
-
 # Classes supporting torch.save/load
 class TorchSaver:
     def __init__(self) -> None:
@@ -360,25 +270,6 @@ class SsdParameter(torch.nn.Parameter, SsdTensorHandle):
 
     def __init__(self, shape: Tuple[int, ...], dtype: torch.dtype, requires_grad: bool = True) -> None:
         super(SsdParameter, self).__init__(shape, dtype, requires_grad)  # type: ignore
-
-class SsdTensorHandleView(SsdTensorHandle):
-    @classmethod
-    def from_tensor(cls: SsdTensorHandleView, tensor: SsdTensorHandle, view_callback = None) -> SsdTensorHandleView:
-        r = super(cls, cls).from_tensor(tensor)
-        r.view_callback = view_callback
-        return r
-
-    def __init__(self, shape: Tuple[int, ...], dtype: torch.dtype, requires_grad: bool = True) -> None:
-        super(SsdTensorHandleView, self).__init__(shape, dtype, requires_grad)  # type: ignore
-        self.view_callback = None
-
-    def to_tensor(self) -> torch.Tensor:
-        self.view_callback.to_tensor()
-        return self.tensor
-
-    def to_file(self, permit_when_tensor_none: bool = False, release_tensor_after_write: bool = True) -> None:
-        # PJ TODO: Should we ignore to_file from views?
-        pass
 
 class SsdFlatParameter(torch.nn.Parameter, SsdTensorHandle):
     """ A parameter that is initialized from a list of parameters and can be
@@ -411,20 +302,6 @@ class SsdFlatParameter(torch.nn.Parameter, SsdTensorHandle):
         r = SsdTensorHandle._make_wrapper_subclass(cls, (size,), dtype=dtype, requires_grad=requires_grad)  # type: ignore
         return r
 
-    def to_tensor(self) -> torch.Tensor:
-        if self.tensor is None:
-            # Update Views to point to the new tensor
-            result = super(SsdFlatParameter, self).to_tensor()
-            for view in self.views:
-                view.point_to_tensor(self.tensor.narrow(0, view.offset, view._numel).view(view._shape))
-        return self.tensor
-
-    def to_file(self, permit_when_tensor_none: bool = False, release_tensor_after_write: bool = True) -> None:
-        SsdTensorHandle.to_file(self, permit_when_tensor_none=permit_when_tensor_none, release_tensor_after_write=release_tensor_after_write)
-        if release_tensor_after_write:
-            for view in self.views:
-                view.point_to_file(self.filename, view.offset)
-
     def __init__(self, params: Sequence[torch.nn.Parameter], filename: str, requires_grad: bool = True):
         """ Initialize the _param_numels and _param_shapes lists. """
         self._param_numels = [p.numel() for p in params]
@@ -442,15 +319,8 @@ class SsdFlatParameter(torch.nn.Parameter, SsdTensorHandle):
         tensor.requires_grad = requires_grad
         self.set_file_params(filename, 0)
         self.point_to_tensor(tensor)
-        self.views: List[SsdTensorHandleView] = []
-        offset = 0
-        for (size, shape) in zip(self._param_numels, self._param_shapes):
-            view = SsdTensorHandleView.from_tensor(self.tensor.narrow(0, offset, size).view(shape), view_callback=self)
-            view.set_file_params(filename, offset)
-            self.views.append(view)
-            offset += size
 
-    def get_param_views(self, external_data: Optional[torch.Tensor] = None, as_tensor_handle_view: bool = False) -> Iterator[torch.Tensor]:
+    def get_param_views(self, external_data: Optional[torch.Tensor] = None) -> Iterator[torch.Tensor]:
         """ Return a generator of views that map to the original parameters. """
         # Note, self.data could be sharded, so its numel is <= to the sum.
         '''
@@ -465,10 +335,7 @@ class SsdFlatParameter(torch.nn.Parameter, SsdTensorHandle):
                 )
             return (t.view(s) for (t, s) in zip(external_data.split(self._param_numels), self._param_shapes))
         else:
-            if as_tensor_handle_view:
-                return (v for v in self.views)
-            else:
-                return (t.view(s) for (t, s) in zip(self.split(self._param_numels), self._param_shapes))
+            return (t.view(s) for (t, s) in zip(self.split(self._param_numels), self._param_shapes))
 
     def metadata(self) -> Tuple[List[str], List[torch.Size], List[int]]:
         """Return tuple of (names, shapes, numels) metadata for this flat parameter."""

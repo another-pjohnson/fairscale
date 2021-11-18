@@ -123,6 +123,7 @@ class DistributedTest(unittest.TestCase):
 
 keys = ["reshard_after_forward", "mixed_precision", "flatten_parameters", "nested_wrapping"]
 CONFIG_OPTIONS = [[dict(zip(keys, config))] for config in itertools.product([True, False], repeat=len(keys))]
+CONFIG_OPTIONS_STATIC = [[{"flatten_parameters": True, "mixed_precision": False, "nested_wrapping": False, "reshard_after_forward": False}]]
 
 
 def rename_test(testcase_func, param_num, param):
@@ -261,7 +262,8 @@ class TestSsdLoading(DistributedTest):
     def test_transformer_parameterized(self, config):
         spawn_and_init(functools.partial(self._test_identical_outputs_eval, TransformerWithSharedParams, config))
 
-    @parameterized.expand(CONFIG_OPTIONS, name_func=rename_test)
+    #@parameterized.expand(CONFIG_OPTIONS, name_func=rename_test)
+    @parameterized.expand(CONFIG_OPTIONS_STATIC, name_func=rename_test)
     def test_ssd_offloading_train_flatten_params_wrapper(self, config):
         test_fn = functools.partial(self._test_ssd_offloading_train_flatten_params_wrapper, config=config)
         spawn_and_init(test_fn)
@@ -273,9 +275,6 @@ class TestSsdLoading(DistributedTest):
 
         with tempfile.TemporaryDirectory() as current_tempdir:
             config["offload_config"] = OffloadConfig(offload_type="ssd_offload", ssd_directory=current_tempdir)
-
-            config["mixed_precision"] = False
-            config["flatten_parameters"] = True
 
             nested_wrapping = config["nested_wrapping"]
             del config["nested_wrapping"]
@@ -442,7 +441,7 @@ def spawn_and_init(fn, args=None, **spawn_kwargs):
         args = ()
 
     run_fn = functools.partial(init_and_run, fn, args)
-    spawn_for_all_world_sizes(run_fn, **spawn_kwargs, world_sizes=[1])
+    spawn_for_all_world_sizes(run_fn, **spawn_kwargs)
 
 
 def init_and_run(fn, args, rank, world_size, filename, filename_rpc):
